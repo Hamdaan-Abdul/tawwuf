@@ -16,12 +16,13 @@ class AppTests(unittest.TestCase):
             5: 80,
             15: 80,
             16: 60,
-            (8, 2, False): 100,
-            (10, 2, False): 80,
-            (32, 2, False): 60,
-            (4, 1, True): 80,
-            (5, 1, True): 60,
-            (20, 1, True): 60,
+            (8, 2): 100,
+            (10, 2): 80,
+            (32, 2): 60,
+            (4, 1, "Roadworks"): 80,
+            (5, 1, "Wet road"): 60,
+            (4, 1, "Reduced visibility"): 80,
+            (20, 1, "Roadworks"): 60,
         }
         for inputs, expected in cases.items():
             arguments = inputs if isinstance(inputs, tuple) else (inputs,)
@@ -127,26 +128,9 @@ class AppTests(unittest.TestCase):
         self.assertIsNone(app._select_consistent_lane_estimate([4, 6, 7]))
         self.assertIsNone(app._select_consistent_lane_estimate([4]))
 
-    def test_rain_is_applied_only_on_confident_majority(self):
-        label, confidence, rain_detected = app._summarize_weather(
-            [
-                {"label": "rain", "score": 0.8},
-                {"label": "cloudy", "score": 0.9},
-                {"label": "rain", "score": 0.7},
-            ]
-        )
-        self.assertEqual(label, "Rain")
-        self.assertAlmostEqual(confidence, 0.75)
-        self.assertTrue(rain_detected)
-
-        _, _, rain_detected = app._summarize_weather(
-            [
-                {"label": "rain", "score": 0.55},
-                {"label": "rain", "score": 0.5},
-                {"label": "rain", "score": 0.6},
-            ]
-        )
-        self.assertFalse(rain_detected)
+    def test_speed_rejects_unlisted_road_conditions(self):
+        with self.assertRaisesRegex(ValueError, "listed road conditions"):
+            app.recommended_speed_kmh(4, road_condition="Storm")
 
     def test_context_is_explicitly_a_scenario(self):
         context = app._context_summary(True, "Roadworks", False)
@@ -169,18 +153,18 @@ class AppTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Upload or load"):
             app._resolve_video_path(None)
 
+    def test_video_rejects_unknown_road_condition(self):
+        with self.assertRaisesRegex(ValueError, "listed road conditions"):
+            app.process_video("input.mp4", road_condition="Storm")
+
     @patch("cv2.VideoWriter_fourcc", return_value=123)
     @patch("cv2.VideoWriter")
     @patch("cv2.VideoCapture")
     @patch("app._make_trend_plot", return_value="plot")
-    @patch("app._classify_weather_frame", return_value={"label": "cloudy", "score": 0.9})
-    @patch("app.load_weather_classifier")
     @patch("app.load_model")
-    def test_video_tracks_unique_vehicles_and_uses_peak_count_for_speed(
+    def test_video_counts_all_vehicle_classes_and_uses_peak_count_for_speed(
         self,
         load_model,
-        _load_weather_classifier,
-        _classify_weather_frame,
         _make_trend_plot,
         video_capture,
         video_writer,
@@ -206,17 +190,17 @@ class AppTests(unittest.TestCase):
 
         detections = iter(
             [
-                (16, list(range(16))),
-                (2, [0, 1]),
-                (1, [0]),
+                ([0] * 12 + [1, 2, 3, 1, 4], list(range(17))),
+                ([1, 1], [0, 12]),
+                ([1], [0]),
             ]
         )
 
         class FakeBoxes:
-            def __init__(self, count, ids):
-                self.cls = SimpleNamespace(tolist=lambda: [app.CAR_CLASS_ID] * count)
+            def __init__(self, class_ids, ids):
+                self.cls = SimpleNamespace(tolist=lambda: class_ids)
                 self.xyxy = SimpleNamespace(
-                    tolist=lambda: [(0, 0, 1, 1)] * count
+                    tolist=lambda: [(0, 0, 1, 1)] * len(class_ids)
                 )
                 self.id = SimpleNamespace(
                     int=lambda: SimpleNamespace(tolist=lambda: ids)
@@ -227,30 +211,52 @@ class AppTests(unittest.TestCase):
 
         class FakeModel:
             def __init__(self):
-                self.names = {0: "person", 2: "car", 7: "truck"}
+                self.names = {
+                    0: "car",
+                    1: "bus",
+                    2: "truck",
+                    3: "van",
+                    4: "person",
+                }
+                self.track_call_count = 0
 
             def track(self, **_kwargs):
-                count, ids = next(detections)
+                self.uses_botsort = _kwargs["tracker"] == "botsort.yaml"
+                self.track_call_count += 1
+                class_ids, ids = next(detections)
                 return [
                     SimpleNamespace(
-                        boxes=FakeBoxes(count, ids),
+                        boxes=FakeBoxes(class_ids, ids),
                         plot=lambda: frames[0],
                     )
                 ]
 
         load_model.return_value = FakeModel()
 
-        output_path, speed_text, _weather, _plot, summary = app.process_video(
+        output_path, speed_text, condition_text, _plot, summary = app.process_video(
             "input.mp4",
-            lane_count=1,
-            frame_stride=1,
+            lane_count=4,
+            road_condition="Roadworks",
             progress=Mock(),
         )
         try:
-            self.assertIn("60 km/h", speed_text)
-            self.assertIn("Peak sampled frame: 16 cars", speed_text)
-            self.assertIn("16 cars, 0 trucks/buses/vans", speed_text)
-            self.assertIn("Counts are approximate", summary)
+            load_model.assert_called_once_with()
+            self.assertEqual(load_model.return_value.track_call_count, len(frames))
+            self.assertTrue(load_model.return_value.uses_botsort)
+            self.assertEqual(writer.write.call_count, len(frames))
+            self.assertIn("80 km/h", speed_text)
+            self.assertIn("Detector: pretrained YOLOv8n (recommended)", speed_text)
+            self.assertIn("Total unique vehicles in clip: 16", speed_text)
+            self.assertIn("Peak frame: 16 vehicles", speed_text)
+            self.assertIn("12 cars, 4 buses/trucks/vans", speed_text)
+            self.assertIn("Total unique vehicles in clip: 16", summary)
+            self.assertIn("Tracked class totals: 11 cars, 5 buses/trucks/vans", summary)
+            self.assertIn("tracked on every frame", summary)
+            self.assertIn("Road condition scenario:** Roadworks", condition_text)
+            self.assertIn("lowers the demo recommendation by one band", condition_text)
+            self.assertIn("Detection model: pretrained YOLOv8n", summary)
+            self.assertIn("Road scenario: Roadworks", summary)
+            self.assertIn("estimates rather than ground truth", summary)
             video_writer_fourcc.assert_called_once_with(*"avc1")
             self.assertTrue(output_path.endswith(".mp4"))
         finally:
@@ -263,14 +269,10 @@ class AppTests(unittest.TestCase):
     @patch("cv2.VideoWriter")
     @patch("cv2.VideoCapture")
     @patch("app._make_trend_plot", return_value="plot")
-    @patch("app._classify_weather_frame", return_value={"label": "cloudy", "score": 0.9})
-    @patch("app.load_weather_classifier")
     @patch("app.load_model")
     def test_automatic_lane_estimate_is_used_and_reported(
         self,
         load_model,
-        _load_weather_classifier,
-        _classify_weather_frame,
         _make_trend_plot,
         video_capture,
         video_writer,
@@ -322,17 +324,16 @@ class AppTests(unittest.TestCase):
         output_path, speed_text, _weather, _plot, summary = app.process_video(
             "input.mp4",
             lane_count=1,
-            frame_stride=1,
             detect_lanes_automatically=True,
             progress=Mock(),
         )
         try:
-            self.assertIn("12 cars across 4 lane(s)", speed_text)
+            self.assertIn("12 vehicles across 4 lane(s)", speed_text)
             self.assertIn(
                 "Lane count: 4 (automatic road-area estimate from 2 frame(s))",
                 speed_text,
             )
-            self.assertIn("12 cars, 0 trucks/buses/vans", speed_text)
+            self.assertIn("12 cars, 0 buses/trucks/vans", speed_text)
             self.assertIn("estimates: [4, 6]", summary)
             self.assertEqual(estimate_lane_count.call_count, 2)
             self.assertEqual(segment_road_surface.call_count, 2)

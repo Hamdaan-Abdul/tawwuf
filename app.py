@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import math
-import os
 import tempfile
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -15,13 +15,11 @@ PROGRESS_TRACKER = Progress(track_tqdm=False)
 
 PERSON_CLASS_ID = 0
 CAR_CLASS_ID = 2
-TRUCK_CLASS_ID = 7
 MODEL_REPO = "Ultralytics/YOLOv8"
 MODEL_FILE = "yolov8n.pt"
-TRAFFIC_MODEL_REPO = os.getenv("TRAFFIC_MODEL_REPO")
-WEATHER_MODEL_REPO = "dima806/weather_types_image_detection"
 LANE_SCENE_MODEL_REPO = "nvidia/segformer-b0-finetuned-cityscapes-1024-1024"
-WEATHER_RAIN_CONFIDENCE = 0.60
+ROAD_CONDITIONS = ("Normal", "Wet road", "Roadworks", "Reduced visibility")
+RESTRICTIVE_ROAD_CONDITIONS = {"Wet road", "Roadworks", "Reduced visibility"}
 SAMPLE_VIDEO_REPO = "parsafaramarzi/Small-Crowd-and-Traffic-Video-Footages"
 SAMPLE_VIDEOS = {
     "Car traffic sample 03 (13 MB)": "cartraffic03.mp4",
@@ -32,22 +30,24 @@ SAMPLE_VIDEOS = {
 
 
 def recommended_speed_kmh(
-    car_count: int,
+    vehicle_count: int,
     lane_count: int = 1,
-    rain_detected: bool = False,
+    road_condition: str = "Normal",
 ) -> int:
-    """Return a demo speed based on detected cars per lane and estimated rain."""
+    """Return a demo speed based on vehicle density and selected road scenario."""
     lane_count = _validate_lane_count(lane_count)
+    if road_condition not in ROAD_CONDITIONS:
+        raise ValueError("Choose one of the listed road conditions.")
 
-    cars_per_lane = car_count / lane_count
-    if cars_per_lane < 5:
+    vehicles_per_lane = vehicle_count / lane_count
+    if vehicles_per_lane < 5:
         speed = 100
-    elif cars_per_lane <= 15:
+    elif vehicles_per_lane <= 15:
         speed = 80
     else:
         speed = 60
 
-    if rain_detected:
+    if road_condition in RESTRICTIVE_ROAD_CONDITIONS:
         speed = max(60, speed - 20)
     return speed
 
@@ -233,77 +233,15 @@ def _detection_class_ids(model: Any) -> tuple[list[int], set[int], set[int], set
 
 @lru_cache(maxsize=1)
 def load_model() -> Any:
-    """Load fine-tuned weights when configured, otherwise the pretrained model."""
+    """Load the pretrained YOLOv8n detector from the Hugging Face Hub."""
     from huggingface_hub import hf_hub_download
     from ultralytics import YOLO
-
-    if TRAFFIC_MODEL_REPO:
-        weights_path = hf_hub_download(
-            repo_id=TRAFFIC_MODEL_REPO,
-            filename="best.pt",
-        )
-        return YOLO(weights_path)
 
     weights_path = hf_hub_download(
         repo_id=MODEL_REPO,
         filename=MODEL_FILE,
     )
     return YOLO(weights_path)
-
-
-@lru_cache(maxsize=1)
-def load_weather_classifier() -> Any:
-    """Load an image weather classifier from the Hugging Face Hub."""
-    from transformers import pipeline
-
-    return pipeline(
-        "image-classification",
-        model=WEATHER_MODEL_REPO,
-        device=-1,
-    )
-
-
-def _classify_weather_frame(frame: Any) -> dict:
-    """Classify one OpenCV BGR frame with the cached Hugging Face model."""
-    import cv2
-    from PIL import Image
-
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    predictions = load_weather_classifier()(Image.fromarray(rgb_frame), top_k=1)
-    if predictions and isinstance(predictions[0], list):
-        prediction = predictions[0][0]
-    elif predictions:
-        prediction = predictions[0]
-    else:
-        raise RuntimeError("The weather classifier returned no predictions.")
-
-    return {
-        "label": str(prediction["label"]),
-        "score": float(prediction["score"]),
-    }
-
-
-def _summarize_weather(predictions: list[dict]) -> tuple[str, float, bool]:
-    """Aggregate sampled weather classifications and gate the rain adjustment."""
-    if not predictions:
-        return "Unavailable", 0.0, False
-
-    from collections import Counter
-
-    labels = [prediction["label"].strip().lower() for prediction in predictions]
-    label_counts = Counter(labels)
-    label = label_counts.most_common(1)[0][0]
-    confidence = sum(
-        prediction["score"]
-        for prediction, predicted_label in zip(predictions, labels)
-        if predicted_label == label
-    ) / label_counts[label]
-    rain_detected = (
-        label == "rain"
-        and label_counts[label] > len(predictions) / 2
-        and confidence >= WEATHER_RAIN_CONFIDENCE
-    )
-    return label.title(), confidence, rain_detected
 
 
 def load_sample_video(sample_name: str) -> str:
@@ -345,7 +283,7 @@ def _make_trend_plot(timeline: Any) -> Any:
     figure, axis = plt.subplots(figsize=(9, 4))
     for column, label in (
         ("Cars", "Cars"),
-        ("Trucks", "Trucks"),
+        ("Other vehicles", "Buses/trucks/vans"),
         ("People detected", "People"),
     ):
         axis.plot(timeline["Time (seconds)"], timeline[column], label=label)
@@ -374,7 +312,6 @@ def process_video(
     video_path: Any,
     lane_count: int = 1,
     detect_lanes_automatically: bool = False,
-    frame_stride: int = 1,
     school_peak: bool = False,
     road_condition: str = "Normal",
     high_risk_zone: bool = False,
@@ -382,9 +319,8 @@ def process_video(
 ) -> tuple[str, str, str, Any, str]:
     """Annotate a video and return recommendation, trend data, and summary."""
     lane_count = _validate_lane_count(lane_count)
-    if frame_stride < 1:
-        raise ValueError("Frame interval must be at least one.")
-    frame_stride = int(frame_stride)
+    if road_condition not in ROAD_CONDITIONS:
+        raise ValueError("Choose one of the listed road conditions.")
     video_path = _resolve_video_path(video_path)
 
     import cv2
@@ -417,16 +353,11 @@ def process_video(
     writer = None
     frame_number = 0
     sample_count = 0
-    tracked_car_ids: set[int] = set()
-    tracked_truck_ids: set[int] = set()
+    track_class_observations: dict[int, Counter[str]] = {}
     tracking_ids_available = True
     lane_count_source = "manual"
     lane_estimate_status = ""
     lane_estimates: list[int] = []
-    weather_predictions = []
-    weather_frame_indices = (
-        {0, total_frames // 2, total_frames - 1} if total_frames > 0 else {0}
-    )
     records: list[dict] = []
     succeeded = False
 
@@ -445,8 +376,6 @@ def process_video(
             car_class_ids,
             heavy_vehicle_class_ids,
         ) = _detection_class_ids(model)
-        progress(0.03, desc="Loading weather classifier from Hugging Face...")
-        load_weather_classifier()
         progress(0.05, desc="Analyzing video frames...")
         progress_interval = max(1, total_frames // 50) if total_frames > 0 else 30
 
@@ -467,61 +396,65 @@ def process_video(
                 if detected_lane_count is not None:
                     lane_estimates.append(detected_lane_count)
 
-            if frame_number in weather_frame_indices:
-                weather_predictions.append(_classify_weather_frame(frame))
-
-            if frame_number % frame_stride == 0:
-                result = model.track(
-                    source=frame,
-                    classes=detection_class_ids,
-                    persist=True,
-                    tracker="bytetrack.yaml",
-                    verbose=False,
-                )[0]
-                boxes = result.boxes
-                class_ids = boxes.cls.tolist() if boxes is not None else []
-                people = sum(int(class_id) in person_class_ids for class_id in class_ids)
-                cars = sum(int(class_id) in car_class_ids for class_id in class_ids)
-                trucks = sum(
-                    int(class_id) == TRUCK_CLASS_ID for class_id in class_ids
-                )
-                if boxes is not None and len(boxes):
-                    track_ids = boxes.id
-                    if track_ids is None:
-                        tracking_ids_available = False
-                    else:
-                        for class_id, track_id in zip(
-                            class_ids, track_ids.int().tolist()
-                        ):
-                            if int(class_id) in car_class_ids:
-                                tracked_car_ids.add(track_id)
-                            elif int(class_id) in heavy_vehicle_class_ids:
-                                tracked_truck_ids.add(track_id)
-
-                if boxes is not None and len(boxes):
-                    box_coords = boxes.xyxy.tolist()
-                    box_area = sum(
-                        max(0.0, x2 - x1) * max(0.0, y2 - y1)
-                        for x1, y1, x2, y2 in box_coords
-                    )
-                    frame_area = float(frame.shape[0] * frame.shape[1])
-                    occupancy = min(100.0, box_area / frame_area * 100.0)
+            result = model.track(
+                source=frame,
+                classes=detection_class_ids,
+                persist=True,
+                tracker="botsort.yaml",
+                verbose=False,
+            )[0]
+            boxes = result.boxes
+            class_ids = boxes.cls.tolist() if boxes is not None else []
+            people = sum(int(class_id) in person_class_ids for class_id in class_ids)
+            cars = sum(int(class_id) in car_class_ids for class_id in class_ids)
+            other_vehicles = sum(
+                int(class_id) in heavy_vehicle_class_ids for class_id in class_ids
+            )
+            vehicles = cars + other_vehicles
+            if boxes is not None and len(boxes):
+                track_ids = boxes.id
+                if track_ids is None:
+                    tracking_ids_available = False
                 else:
-                    occupancy = 0.0
+                    for class_id, track_id in zip(
+                        class_ids, track_ids.int().tolist()
+                    ):
+                        if int(class_id) in car_class_ids:
+                            track_class_counts = track_class_observations.setdefault(
+                                track_id,
+                                Counter(),
+                            )
+                            track_class_counts["car"] += 1
+                        elif int(class_id) in heavy_vehicle_class_ids:
+                            track_class_counts = track_class_observations.setdefault(
+                                track_id,
+                                Counter(),
+                            )
+                            track_class_counts["other"] += 1
 
-                records.append(
-                    {
-                        "Time (seconds)": frame_number / fps,
-                        "Cars": cars,
-                        "Trucks": trucks,
-                        "People detected": people,
-                        "Detected box area (%)": round(occupancy, 2),
-                    }
+            if boxes is not None and len(boxes):
+                box_coords = boxes.xyxy.tolist()
+                box_area = sum(
+                    max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                    for x1, y1, x2, y2 in box_coords
                 )
-                annotated_frame = result.plot()
-                sample_count += 1
+                frame_area = float(frame.shape[0] * frame.shape[1])
+                occupancy = min(100.0, box_area / frame_area * 100.0)
             else:
-                annotated_frame = frame
+                occupancy = 0.0
+
+            records.append(
+                {
+                    "Time (seconds)": frame_number / fps,
+                    "Vehicles": vehicles,
+                    "Cars": cars,
+                    "Other vehicles": other_vehicles,
+                    "People detected": people,
+                    "Detected box area (%)": round(occupancy, 2),
+                }
+            )
+            annotated_frame = result.plot()
+            sample_count += 1
 
             if writer is None:
                 height, width = frame.shape[:2]
@@ -572,53 +505,62 @@ def process_video(
         trend_plot = _make_trend_plot(timeline)
         succeeded = True
 
-        weather_label, weather_confidence, rain_detected = _summarize_weather(
-            weather_predictions
-        )
-        traffic_peak = timeline.loc[timeline["Cars"].idxmax()]
+        traffic_peak = timeline.loc[timeline["Vehicles"].idxmax()]
+        peak_vehicle_count = int(traffic_peak["Vehicles"])
         peak_car_count = int(traffic_peak["Cars"])
-        cars_per_lane = peak_car_count / lane_count
+        peak_other_vehicle_count = int(traffic_peak["Other vehicles"])
+        vehicles_per_lane = peak_vehicle_count / lane_count
         speed = recommended_speed_kmh(
-            peak_car_count,
+            peak_vehicle_count,
             lane_count=lane_count,
-            rain_detected=rain_detected,
+            road_condition=road_condition,
         )
         if tracking_ids_available:
+            track_class_totals = Counter(
+                observations.most_common(1)[0][0]
+                for observations in track_class_observations.values()
+            )
+            total_unique_vehicles = len(track_class_observations)
             unique_vehicle_summary = (
-                f"Unique tracked vehicles in clip: {len(tracked_car_ids)} cars, "
-                f"{len(tracked_truck_ids)} trucks/buses/vans"
+                f"Tracked class totals: {track_class_totals['car']} cars, "
+                f"{track_class_totals['other']} buses/trucks/vans"
+            )
+            total_vehicle_summary = (
+                f"Total unique vehicles in clip: {total_unique_vehicles}"
             )
         else:
             unique_vehicle_summary = (
                 "Unique vehicle count unavailable: the model did not return "
                 "tracking IDs for every detected vehicle."
             )
-        weather_text = (
-            f"**Video weather estimate:** {weather_label} "
-            f"({weather_confidence:.0%} confidence, "
-            f"{len(weather_predictions)} sampled frame(s))"
+            total_vehicle_summary = unique_vehicle_summary
+        condition_text = (
+            f"**Road condition scenario:** {road_condition} "
+            "(manually selected; not detected from the video). "
+            "Automatic weather classification is disabled because it was "
+            "unreliable on traffic-camera footage."
         )
-        if rain_detected:
-            weather_text += (
-                "\n\nRain confidence passed the demo threshold; the speed "
-                "output was lowered one band."
-            )
-        else:
-            weather_text += (
-                "\n\nRain adjustment not applied; weather estimates are "
-                "experimental and may be incorrect."
+        if road_condition in RESTRICTIVE_ROAD_CONDITIONS:
+            condition_text += (
+                "\n\nThe selected condition lowers the demo recommendation "
+                "by one band (20 km/h, with a 60 km/h floor)."
             )
         speed_text = (
             f"## {speed} km/h\n"
-            f"Demo only · Peak sampled frame: {peak_car_count} cars across "
-            f"{lane_count} lane(s) ({cars_per_lane:.1f} cars per lane)"
+            "Detector: pretrained YOLOv8n (recommended)\n\n"
+            f"Demo only · {total_vehicle_summary}\n\n"
+            f"Peak frame: {peak_vehicle_count} vehicles across "
+            f"{lane_count} lane(s) "
+            f"({vehicles_per_lane:.1f} vehicles per lane)\n\n"
+            f"Class labels at peak: {peak_car_count} cars, "
+            f"{peak_other_vehicle_count} buses/trucks/vans"
         )
         speed_text += f"\n\nLane count: {lane_count} ({lane_count_source})"
         if lane_estimate_status:
             speed_text += f"\n\n{lane_estimate_status}"
         speed_text += f"\n\n{unique_vehicle_summary}"
 
-        traffic_lull = timeline.loc[timeline["Cars"].idxmin()]
+        traffic_lull = timeline.loc[timeline["Vehicles"].idxmin()]
         people_peak = timeline.loc[timeline["People detected"].idxmax()]
         crowd_note = (
             "People detected are a rough visual count, not a measure of "
@@ -646,35 +588,39 @@ def process_video(
             )
         summary = (
             "### Clip analysis\n"
+            "- Detection model: pretrained YOLOv8n from Hugging Face\n"
             f"- Frames: {source_frames} · analyzed: {sample_count} · "
-            f"interval: every {frame_stride} frame(s)\n"
-            f"- Peak car detections in one analyzed frame: {peak_car_count} at "
+            "tracked on every frame\n"
+            f"- {total_vehicle_summary}\n"
+            f"- Peak vehicles in one frame: "
+            f"{peak_vehicle_count} at "
             f"{float(traffic_peak['Time (seconds)']):.1f}s into the clip\n"
-            f"- Lowest car detections: {int(traffic_lull['Cars'])} at "
+            f"- Class labels at peak: {peak_car_count} cars, "
+            f"{peak_other_vehicle_count} buses/trucks/vans\n"
+            f"- Lowest vehicle detections: {int(traffic_lull['Vehicles'])} at "
             f"{float(traffic_lull['Time (seconds)']):.1f}s into the clip\n"
             f"{people_summary}"
             f"- Peak detected box area: "
             f"{float(timeline['Detected box area (%)'].max()):.1f}% of frame\n\n"
-            f"- Lanes used: {lane_count} · peak sampled cars per lane: "
-            f"{cars_per_lane:.1f}\n\n"
+            f"- Lanes used: {lane_count} · peak vehicles per lane: "
+            f"{vehicles_per_lane:.1f}\n\n"
             f"{lane_source_summary}\n"
             f"- {unique_vehicle_summary}\n"
-            "  Counts are approximate: tracking only sees analyzed frames and "
-            "can miss or duplicate vehicles, especially at larger intervals. "
-            "Lower the interval to improve tracking continuity.\n\n"
+            "  Tracking can still miss a vehicle or assign a new ID after "
+            "occlusion, so totals are estimates rather than ground truth.\n\n"
             "**Other scenario inputs (simulated, not live feeds):** "
             f"{_context_summary(school_peak, road_condition, high_risk_zone)}\n\n"
             f"**Scope:** {crowd_note} {timing_note}\n\n"
-            "**Demo rule:** thresholds apply to cars per lane "
-            "(<5: 100; 5–15: 80; >15: 60 km/h). If rain wins a majority of "
-            "sampled weather predictions at ≥60% mean confidence, lower one "
-            "band (100→80, 80→60, 60 stays 60). These values are not validated "
+            "**Demo rule:** thresholds apply to all detected vehicles per lane "
+            "(<5: 100; 5–15: 80; >15: 60 km/h). A manually selected wet road, "
+            "roadworks, or reduced-visibility scenario lowers one band "
+            "(100→80, 80→60, 60 stays 60). These values are not validated "
             "speed limits. "
             "No live camera, weather service, school calendar, road-condition "
             "feed, accident data, or traffic sign is connected."
         )
         progress(1, desc="Analysis complete")
-        return str(output_path), speed_text, weather_text, trend_plot, summary
+        return str(output_path), speed_text, condition_text, trend_plot, summary
     finally:
         capture.release()
         if writer is not None:
@@ -745,9 +691,9 @@ def launch_app() -> None:
             "# Tawwuf Traffic Intelligence\n"
             "### A Hugging Face-powered research prototype for Doha traffic scenarios\n\n"
             "Upload an authorized clip to explore vehicle and pedestrian-count "
-            "trends. Weather is estimated from sampled frames; school, road, "
-            "and zone inputs remain simulated until approved local data feeds "
-            "are available."
+            "trends. Road, school, and zone inputs are manually selected "
+            "scenarios. Automatic weather classification is disabled because "
+            "it was unreliable on traffic-camera footage."
         )
         gr.Markdown(
             "<div class='safety-note'><b>Research demo only.</b> This app "
@@ -784,19 +730,6 @@ def launch_app() -> None:
                             "card is sparse; verify source terms before reuse "
                             "outside testing."
                         )
-                        frame_stride = gr.Slider(
-                            minimum=1,
-                            maximum=15,
-                            value=15,
-                            step=1,
-                            label="Analyze every Nth frame",
-                            info=(
-                                "Default 15 analyzes fewer frames and is faster; "
-                                "lower values give denser sampling and improve "
-                                "tracking continuity. Unsampled frames are not "
-                                "boxed."
-                            ),
-                        )
                         lane_count = gr.Number(
                             value=3,
                             minimum=1,
@@ -825,20 +758,20 @@ def launch_app() -> None:
                                 value=False,
                             )
                             road_condition = gr.Dropdown(
-                                [
-                                    "Normal",
-                                    "Wet road",
-                                    "Roadworks",
-                                    "Reduced visibility",
-                                ],
+                                list(ROAD_CONDITIONS),
                                 value="Normal",
                                 label="Road condition",
+                                info=(
+                                    "Wet road, roadworks, and reduced visibility "
+                                    "lower the demo speed by one band. This is "
+                                    "a manual scenario, not video detection."
+                                ),
                             )
                             high_risk_zone = gr.Checkbox(
                                 label="Known high-risk-zone scenario",
                                 value=False,
                             )
-                        load_sample_button.click(
+                            load_sample_button.click(
                             fn=load_sample_video,
                             inputs=sample_video,
                             outputs=input_video,
@@ -849,13 +782,13 @@ def launch_app() -> None:
                             "## -- km/h\nDemo recommendation",
                             elem_classes=["speed-card"],
                         )
-                        weather_output = gr.Markdown(
-                            "**Video weather estimate:** waiting for analysis\n\n"
-                            "Experimental frame classifier; not validated for "
-                            "traffic-camera weather or speed control."
+                        condition_output = gr.Markdown(
+                            "**Road condition scenario:** waiting for analysis\n\n"
+                            "Selected manually. Automatic weather classification "
+                            "is disabled because it was unreliable."
                         )
                         output_video = gr.Video(
-                            label="Video with sampled-frame detections"
+                            label="Video with tracked detections on every frame"
                         )
                 trend_plot = gr.Plot(
                     label="Traffic and people detected over clip time",
@@ -868,7 +801,6 @@ def launch_app() -> None:
                         input_video,
                         lane_count,
                         detect_lanes_automatically,
-                        frame_stride,
                         school_peak,
                         road_condition,
                         high_risk_zone,
@@ -876,7 +808,7 @@ def launch_app() -> None:
                     outputs=[
                         output_video,
                         speed_output,
-                        weather_output,
+                        condition_output,
                         trend_plot,
                         analysis_summary,
                     ],
@@ -928,8 +860,9 @@ def launch_app() -> None:
             with gr.Accordion("How to interpret this demo", open=False):
                 gr.Markdown(
                     "### What the prototype measures\n"
-                    "- YOLOv8 detects cars, trucks, and people in sampled "
-                    "frames; ByteTrack estimates unique cars and trucks "
+                    "- YOLOv8 detects cars, buses, trucks, vans, and people "
+                    "on every frame; BoT-SORT estimates unique cars and "
+                    "other vehicles "
                     "across those frames.\n"
                     "- The trend plot shows detections during this clip only. "
                     "It does not track unique people or infer crossing intent "
@@ -937,9 +870,11 @@ def launch_app() -> None:
                     "- Detected box area is a rough image-occupancy proxy, "
                     "not calibrated road density.\n"
                     "- The 100/80/60 km/h thresholds are the original demo "
-                    "rule, based on car detections in the busiest analyzed "
-                    "frame. Scenario controls do not alter it. Tracking totals "
-                    "are approximate, especially with larger frame intervals.\n\n"
+                    "rule, based on vehicle detections in the busiest "
+                    "frame. Wet road, roadworks, and reduced visibility "
+                    "lower the demo result one band; school and high-risk-zone "
+                    "controls do not alter it. Tracking totals remain "
+                    "estimates because occlusion can break tracks.\n\n"
                     "### What is needed before a Qatar pilot\n"
                     "Authorized camera access; privacy review; reliable "
                     "timestamped weather, school-calendar, roadworks, and "
