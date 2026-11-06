@@ -1,2 +1,5 @@
+gradio==4.44.1
 huggingface_hub
+pandas<3
+pydantic<2.11
 ultralytics
