@@ -116,6 +116,14 @@ pretrained detector instead. Treat the fine-tuned model's labels and counts as
 experimental; improving it requires representative, correctly labeled traffic
 data and retraining.
 
+To compare the fine-tuned checkpoint and pretrained YOLOv8n on the same public
+traffic sample, run `.venv/bin/python test_model.py`. The script analyzes every
+fifth frame by default, saves one annotated video per model plus
+`comparison.json` under a new `runs/model-comparison-*` directory, and reports
+per-frame detection summaries. Pass `--video path/to/clip.mp4` to test a local
+clip or `--stride 1` to analyze every frame. This sample has no ground-truth
+labels, so counts alone cannot determine which detector is more accurate.
+
 The fine-tuned detector covers cars, buses, trucks, and vans, but not people.
 When using it, pedestrian detections are unavailable. It is not validated for
 Qatar roads or operational speed-control use.
