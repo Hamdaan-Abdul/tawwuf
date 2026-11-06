@@ -23,6 +23,13 @@ MODEL_REPO = "Ultralytics/YOLOv8"
 MODEL_FILE = "yolov8n.pt"
 LANE_SCENE_MODEL_REPO = "nvidia/segformer-b0-finetuned-cityscapes-1024-1024"
 ROAD_CONDITIONS = ("Normal", "Wet road", "Roadworks", "Reduced visibility")
+ROAD_CONTEXT_SPEED_CAPS = {
+    "Narrow/local street": 40,
+    "Urban street": 60,
+    "Urban arterial": 80,
+    "Highway/expressway": 100,
+}
+DEFAULT_ROAD_CONTEXT = "Narrow/local street"
 WEATHER_ADJUSTMENT_FACTORS = {"precipitation", "visibility", "high wind"}
 ROAD_CONDITION_FACTORS = {
     "Wet road": "precipitation",
@@ -43,28 +50,25 @@ def recommended_speed_kmh(
     lane_count: int = 1,
     road_condition: str = "Normal",
     weather_factors: tuple[str, ...] = (),
+    road_context: str = DEFAULT_ROAD_CONTEXT,
 ) -> int:
-    """Return a demo speed based on density and selected road/weather factors."""
+    """Return a demo speed capped by road context and adjusted for conditions."""
     lane_count = _validate_lane_count(lane_count)
     if road_condition not in ROAD_CONDITIONS:
         raise ValueError("Choose one of the listed road conditions.")
+    if road_context not in ROAD_CONTEXT_SPEED_CAPS:
+        raise ValueError("Choose one of the listed road contexts.")
     unknown_factors = set(weather_factors) - WEATHER_ADJUSTMENT_FACTORS
     if unknown_factors:
         raise ValueError(f"Unknown weather adjustment factors: {unknown_factors}.")
 
-    vehicles_per_lane = vehicle_count / lane_count
-    if vehicles_per_lane < 5:
-        speed = 100
-    elif vehicles_per_lane <= 15:
-        speed = 80
-    else:
-        speed = 60
+    speed = _density_speed_kmh(vehicle_count, lane_count)
 
     adjustment_factors = set(weather_factors)
     if road_condition in ROAD_CONDITION_FACTORS:
         adjustment_factors.add(ROAD_CONDITION_FACTORS[road_condition])
-    speed = max(60, speed - 20 * len(adjustment_factors))
-    return speed
+    context_capped_speed = min(speed, ROAD_CONTEXT_SPEED_CAPS[road_context])
+    return max(20, context_capped_speed - 20 * len(adjustment_factors))
 
 
 def _weather_description(weather_code: int) -> str:
@@ -193,6 +197,16 @@ def _validate_lane_count(lane_count: Any) -> int:
     if normalized < 1 or normalized != lane_count:
         raise ValueError("Lane count must be a whole number of at least one.")
     return normalized
+
+
+def _density_speed_kmh(vehicle_count: int, lane_count: int) -> int:
+    """Map peak vehicles per lane to an illustrative traffic speed band."""
+    vehicles_per_lane = vehicle_count / lane_count
+    if vehicles_per_lane < 5:
+        return 100
+    if vehicles_per_lane <= 15:
+        return 80
+    return 60
 
 
 def _estimate_visible_lane_count(frame: Any, road_mask: Any = None) -> int | None:
@@ -395,11 +409,13 @@ def _context_summary(
     school_peak: bool,
     road_condition: str,
     high_risk_zone: bool,
+    road_context: str = DEFAULT_ROAD_CONTEXT,
 ) -> str:
     """Describe user-selected scenario context without implying sensor data."""
     flags = [
         "School-peak scenario: {}".format("On" if school_peak else "Off"),
         f"Road scenario: {road_condition}",
+        f"Road context: {road_context}",
         "High-risk-zone scenario: {}".format("On" if high_risk_zone else "Off"),
     ]
     return " · ".join(flags)
@@ -472,12 +488,15 @@ def process_video(
     road_condition: str = "Normal",
     weather_location: str = "",
     high_risk_zone: bool = False,
+    road_context: str = DEFAULT_ROAD_CONTEXT,
     progress: Progress = PROGRESS_TRACKER,
 ) -> tuple[str, str, str, Any, str]:
     """Annotate a video and return recommendation, trend data, and summary."""
     lane_count = _validate_lane_count(lane_count)
     if road_condition not in ROAD_CONDITIONS:
         raise ValueError("Choose one of the listed road conditions.")
+    if road_context not in ROAD_CONTEXT_SPEED_CAPS:
+        raise ValueError("Choose one of the listed road contexts.")
     try:
         normalized_frame_stride = int(frame_stride)
     except (TypeError, ValueError, OverflowError) as error:
@@ -690,6 +709,8 @@ def process_video(
         peak_car_count = int(traffic_peak["Cars"])
         peak_other_vehicle_count = int(traffic_peak["Other vehicles"])
         vehicles_per_lane = peak_vehicle_count / lane_count
+        density_speed = _density_speed_kmh(peak_vehicle_count, lane_count)
+        road_speed_cap = ROAD_CONTEXT_SPEED_CAPS[road_context]
         speed = recommended_speed_kmh(
             peak_vehicle_count,
             lane_count=lane_count,
@@ -697,6 +718,7 @@ def process_video(
             weather_factors=(
                 tuple(weather["adjustment_factors"]) if weather is not None else ()
             ),
+            road_context=road_context,
         )
         if tracking_ids_available:
             track_class_totals = Counter(
@@ -756,8 +778,8 @@ def process_video(
             weather is not None and weather["adjustment_factors"]
         ):
             condition_text += (
-                "\n\nEach distinct factor lowers the density-based demo "
-                "recommendation by one 20 km/h band, down to 60 km/h. "
+                "\n\nEach distinct factor lowers the road-context-capped demo "
+                "recommendation by 20 km/h, down to 20 km/h. "
                 "Duplicate wet-road/rain or reduced-visibility/fog factors "
                 "are counted once."
             )
@@ -768,6 +790,9 @@ def process_video(
             f"Peak sampled frame: {peak_vehicle_count} vehicles across "
             f"{lane_count} lane(s) "
             f"({vehicles_per_lane:.1f} vehicles per lane)\n\n"
+            f"Road context: {road_context} "
+            f"(demo cap {road_speed_cap} km/h) · "
+            f"Traffic-density band: {density_speed} km/h\n\n"
             f"Class labels at peak: {peak_car_count} cars, "
             f"{peak_other_vehicle_count} buses/trucks/vans\n\n"
             f"Weather location: {weather['location'] if weather else 'not entered'}"
@@ -829,12 +854,13 @@ def process_video(
             "occlusion, so totals are estimates rather than ground truth. "
             "Boxes are held between analyzed frames and may lag vehicle motion.\n\n"
             "**Other scenario inputs (simulated, not live feeds):** "
-            f"{_context_summary(school_peak, road_condition, high_risk_zone)}\n\n"
+            f"{_context_summary(school_peak, road_condition, high_risk_zone, road_context)}\n\n"
             f"**Scope:** {crowd_note} {timing_note}\n\n"
             "**Demo rule:** thresholds apply to all detected vehicles per lane "
-            "(<5: 100; 5–15: 80; >15: 60 km/h). Rain, snow, fog, or wind "
-            "at least 50 km/h lowers one band per distinct factor; manually "
-            "selected roadworks and road conditions can add factors. "
+            "(<5: 100; 5–15: 80; >15: 60 km/h), then the selected road context "
+            "caps that result (40/60/80/100 km/h). Rain, snow, fog, or wind "
+            "at least 50 km/h lowers 20 km/h per distinct factor, to a 20 km/h "
+            "floor; manually selected roadworks and road conditions can add factors. "
             "These values are not validated "
             "speed limits. "
             "No live camera, weather service, school calendar, road-condition "
@@ -963,6 +989,18 @@ def launch_app() -> None:
                                 "estimation succeeds."
                             ),
                         )
+                        road_context = gr.Dropdown(
+                            choices=list(ROAD_CONTEXT_SPEED_CAPS),
+                            value=DEFAULT_ROAD_CONTEXT,
+                            label="Road type (sets demo speed cap)",
+                            info=(
+                                "Lane count cannot tell the app how wide or "
+                                "fast a road is. Choose the closest road type; "
+                                "the illustrative cap is applied before traffic "
+                                "and weather adjustments. This is not a posted "
+                                "or legally validated speed limit."
+                            ),
+                        )
                         detect_lanes_automatically = gr.Checkbox(
                             label="Estimate visible lane count automatically",
                             value=False,
@@ -1052,6 +1090,7 @@ def launch_app() -> None:
                         road_condition,
                         weather_location,
                         high_risk_zone,
+                        road_context,
                     ],
                     outputs=[
                         output_video,

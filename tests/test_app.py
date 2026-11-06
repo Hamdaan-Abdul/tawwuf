@@ -25,12 +25,45 @@ class AppTests(unittest.TestCase):
             (4, 1, "Roadworks"): 80,
             (5, 1, "Wet road"): 60,
             (4, 1, "Reduced visibility"): 80,
-            (20, 1, "Roadworks"): 60,
+            (20, 1, "Roadworks"): 40,
         }
         for inputs, expected in cases.items():
             arguments = inputs if isinstance(inputs, tuple) else (inputs,)
             with self.subTest(arguments=arguments):
-                self.assertEqual(app.recommended_speed_kmh(*arguments), expected)
+                self.assertEqual(
+                    app.recommended_speed_kmh(
+                        *arguments,
+                        road_context="Highway/expressway",
+                    ),
+                    expected,
+                )
+
+    def test_road_context_caps_density_speed(self):
+        self.assertEqual(app.recommended_speed_kmh(9, lane_count=1), 40)
+        self.assertEqual(
+            app.recommended_speed_kmh(
+                9,
+                lane_count=1,
+                road_context="Urban street",
+            ),
+            60,
+        )
+        self.assertEqual(
+            app.recommended_speed_kmh(
+                9,
+                lane_count=1,
+                road_context="Highway/expressway",
+            ),
+            80,
+        )
+        self.assertEqual(
+            app.recommended_speed_kmh(
+                40,
+                lane_count=1,
+                road_context="Highway/expressway",
+            ),
+            60,
+        )
 
     def test_lane_count_must_be_a_positive_integer(self):
         for lane_count in (0, -1, 1.5, None):
@@ -135,12 +168,17 @@ class AppTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "listed road conditions"):
             app.recommended_speed_kmh(4, road_condition="Storm")
 
+    def test_speed_rejects_unlisted_road_context(self):
+        with self.assertRaisesRegex(ValueError, "listed road contexts"):
+            app.recommended_speed_kmh(4, road_context="Mountain road")
+
     def test_weather_factors_reduce_speed_and_duplicate_conditions_count_once(self):
         self.assertEqual(
             app.recommended_speed_kmh(
                 4,
                 lane_count=4,
                 weather_factors=("precipitation",),
+                road_context="Highway/expressway",
             ),
             80,
         )
@@ -150,6 +188,7 @@ class AppTests(unittest.TestCase):
                 lane_count=4,
                 road_condition="Wet road",
                 weather_factors=("precipitation",),
+                road_context="Highway/expressway",
             ),
             80,
         )
@@ -159,6 +198,7 @@ class AppTests(unittest.TestCase):
                 lane_count=4,
                 road_condition="Roadworks",
                 weather_factors=("precipitation",),
+                road_context="Highway/expressway",
             ),
             60,
         )
@@ -361,7 +401,8 @@ class AppTests(unittest.TestCase):
             self.assertTrue(load_model.return_value.uses_botsort)
             self.assertEqual(writer.write.call_count, len(frames))
             self.assertTrue(writer.write.call_args_list[1].args[0].any())
-            self.assertIn("60 km/h", speed_text)
+            self.assertIn("20 km/h", speed_text)
+            self.assertIn("Road context: Narrow/local street (demo cap 40 km/h)", speed_text)
             self.assertIn("Detector: pretrained YOLOv8n (recommended)", speed_text)
             self.assertIn("Total unique vehicles in clip: 16", speed_text)
             self.assertIn("Peak sampled frame: 16 vehicles", speed_text)
@@ -377,6 +418,7 @@ class AppTests(unittest.TestCase):
             self.assertIn("Each distinct factor lowers", condition_text)
             self.assertIn("Detection model: pretrained YOLOv8n", summary)
             self.assertIn("Road scenario: Roadworks", summary)
+            self.assertIn("Road context: Narrow/local street", summary)
             self.assertIn("estimates rather than ground truth", summary)
             video_writer_fourcc.assert_called_once_with(*"avc1")
             self.assertTrue(output_path.endswith(".mp4"))

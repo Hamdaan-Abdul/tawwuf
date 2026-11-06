@@ -29,8 +29,8 @@ web server and is expected to keep running. Press `Ctrl+C` when you want to stop
 the server.
 
 Open the local URL printed by Gradio. Upload a video, enter the number of lanes
-visible in the camera view, enter a location for current weather, and select
-the road-condition scenario. The app
+visible in the camera view, choose the road type for an illustrative speed cap,
+enter a location for current weather, and select the road-condition scenario. The app
 uses pretrained YOLOv8n from the Hugging Face Hub; the separately fine-tuned
 model is not used because it misclassifies cars as buses, trucks, or vans. By
 default, detection runs every 5th frame (about 6 detections/second for 30 FPS
@@ -159,13 +159,20 @@ secret and review the source dataset's access terms first.
   manually entered lane count.
 - The speed calculation divides vehicle detections in the busiest frame by
   the manually entered lane count or automatic estimate, then applies
-  the demo thresholds per lane: fewer than 5 vehicles/lane = 100 km/h, 5–15
-  = 80 km/h, more than 15 = 60 km/h. Open-Meteo current precipitation, fog,
-  or wind ≥50 km/h lowers the result one band per distinct factor. Manual wet
+  illustrative traffic bands: fewer than 5 vehicles/lane = 100 km/h, 5–15
+  = 80 km/h, more than 15 = 60 km/h. A manually selected road context caps
+  this result: narrow/local street 40, urban street 60, urban arterial 80,
+  highway/expressway 100 km/h. Current Open-Meteo precipitation, fog, or wind
+  ≥50 km/h lowers the capped result by 20 km/h per distinct factor, to a
+  20 km/h floor. Manual wet
   road/reduced visibility factors are deduplicated against precipitation/fog;
   roadworks is a separate manual factor. This is only appropriate for a video
   matching the entered location and current time. School and high-risk-zone
   controls are simulated scenarios, not live feeds.
+- Lane count does not establish road width, road type, posted speed, or a safe
+  speed. Select the closest road context explicitly; these demo caps and
+  vehicle-count bands are illustrative and are not validated traffic or legal
+  speed recommendations.
 - Dataset search may return data from other countries or with restrictive
   terms. Review provenance, license, privacy, and local relevance before
   research or use.
