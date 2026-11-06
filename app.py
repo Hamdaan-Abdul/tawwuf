@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import math
 import tempfile
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 from gradio import Progress
 
@@ -19,7 +23,12 @@ MODEL_REPO = "Ultralytics/YOLOv8"
 MODEL_FILE = "yolov8n.pt"
 LANE_SCENE_MODEL_REPO = "nvidia/segformer-b0-finetuned-cityscapes-1024-1024"
 ROAD_CONDITIONS = ("Normal", "Wet road", "Roadworks", "Reduced visibility")
-RESTRICTIVE_ROAD_CONDITIONS = {"Wet road", "Roadworks", "Reduced visibility"}
+WEATHER_ADJUSTMENT_FACTORS = {"precipitation", "visibility", "high wind"}
+ROAD_CONDITION_FACTORS = {
+    "Wet road": "precipitation",
+    "Roadworks": "roadworks",
+    "Reduced visibility": "visibility",
+}
 SAMPLE_VIDEO_REPO = "parsafaramarzi/Small-Crowd-and-Traffic-Video-Footages"
 SAMPLE_VIDEOS = {
     "Car traffic sample 03 (13 MB)": "cartraffic03.mp4",
@@ -33,11 +42,15 @@ def recommended_speed_kmh(
     vehicle_count: int,
     lane_count: int = 1,
     road_condition: str = "Normal",
+    weather_factors: tuple[str, ...] = (),
 ) -> int:
-    """Return a demo speed based on vehicle density and selected road scenario."""
+    """Return a demo speed based on density and selected road/weather factors."""
     lane_count = _validate_lane_count(lane_count)
     if road_condition not in ROAD_CONDITIONS:
         raise ValueError("Choose one of the listed road conditions.")
+    unknown_factors = set(weather_factors) - WEATHER_ADJUSTMENT_FACTORS
+    if unknown_factors:
+        raise ValueError(f"Unknown weather adjustment factors: {unknown_factors}.")
 
     vehicles_per_lane = vehicle_count / lane_count
     if vehicles_per_lane < 5:
@@ -47,9 +60,128 @@ def recommended_speed_kmh(
     else:
         speed = 60
 
-    if road_condition in RESTRICTIVE_ROAD_CONDITIONS:
-        speed = max(60, speed - 20)
+    adjustment_factors = set(weather_factors)
+    if road_condition in ROAD_CONDITION_FACTORS:
+        adjustment_factors.add(ROAD_CONDITION_FACTORS[road_condition])
+    speed = max(60, speed - 20 * len(adjustment_factors))
     return speed
+
+
+def _weather_description(weather_code: int) -> str:
+    if weather_code == 0:
+        return "Clear"
+    if weather_code in {1, 2}:
+        return "Mostly clear / partly cloudy"
+    if weather_code == 3:
+        return "Overcast"
+    if weather_code in {45, 48}:
+        return "Fog"
+    if weather_code in {51, 53, 55, 56, 57}:
+        return "Drizzle"
+    if weather_code in {61, 63, 65, 66, 67, 80, 81, 82}:
+        return "Rain"
+    if weather_code in {71, 73, 75, 77, 85, 86}:
+        return "Snow"
+    if weather_code in {95, 96, 99}:
+        return "Thunderstorm"
+    return "Unknown conditions"
+
+
+def _weather_adjustment_factors(weather_code: int, wind_speed_kmh: float) -> set[str]:
+    factors: set[str] = set()
+    if weather_code in {45, 48}:
+        factors.add("visibility")
+    elif weather_code in {
+        51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 71, 73, 75, 77,
+        80, 81, 82, 85, 86, 95, 96, 99,
+    }:
+        factors.add("precipitation")
+    if wind_speed_kmh >= 50:
+        factors.add("high wind")
+    return factors
+
+
+def _open_meteo_json(url: str) -> dict[str, Any]:
+    try:
+        with urlopen(url, timeout=10) as response:
+            data = json.load(response)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Open-Meteo returned invalid JSON.") from error
+    except (URLError, TimeoutError, OSError) as error:
+        raise RuntimeError(
+            "Could not retrieve current weather from Open-Meteo. "
+            "Check the location and internet connection, then try again."
+        ) from error
+    if not isinstance(data, dict):
+        raise TypeError("Open-Meteo returned an unexpected response.")
+    return data
+
+
+def fetch_open_meteo_weather(location: str) -> dict[str, Any]:
+    """Geocode a place and retrieve its current conditions from Open-Meteo."""
+    query = location.strip()
+    if not query:
+        raise ValueError("Enter a location for the Open-Meteo weather lookup.")
+
+    geocoding_url = "https://geocoding-api.open-meteo.com/v1/search?" + urlencode(
+        {"name": query, "count": 1, "language": "en", "format": "json"}
+    )
+    geocoding = _open_meteo_json(geocoding_url)
+    results = geocoding.get("results", [])
+    if not results:
+        raise ValueError(f"Open-Meteo could not find a location for {query!r}.")
+
+    place = results[0]
+    if not isinstance(place, dict):
+        raise TypeError("Open-Meteo returned invalid location data.")
+    try:
+        forecast_query = {
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "current": (
+                "temperature_2m,precipitation,rain,showers,snowfall,"
+                "weather_code,wind_speed_10m"
+            ),
+            "wind_speed_unit": "kmh",
+            "timezone": "auto",
+        }
+    except (KeyError, TypeError) as error:
+        raise RuntimeError("Open-Meteo returned incomplete location data.") from error
+    forecast_url = "https://api.open-meteo.com/v1/forecast?" + urlencode(
+        forecast_query
+    )
+    forecast = _open_meteo_json(forecast_url)
+
+    current = forecast.get("current")
+    if not isinstance(current, dict) or "weather_code" not in current:
+        raise RuntimeError("Open-Meteo returned no current weather for this location.")
+    try:
+        weather_code = int(current["weather_code"])
+        wind_speed = float(current.get("wind_speed_10m", 0.0))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Open-Meteo returned invalid current weather data.") from error
+
+    location_parts = [str(place.get("name", query))]
+    for part in (place.get("admin1"), place.get("country")):
+        if part and str(part).casefold() not in {
+            existing.casefold() for existing in location_parts
+        }:
+            location_parts.append(str(part))
+    return {
+        "location": ", ".join(part for part in location_parts if part),
+        "timezone": str(forecast.get("timezone", place.get("timezone", ""))),
+        "condition": _weather_description(weather_code),
+        "weather_code": weather_code,
+        "temperature_c": current.get("temperature_2m"),
+        "precipitation_mm": current.get("precipitation"),
+        "rain_mm": current.get("rain"),
+        "snowfall_cm": current.get("snowfall"),
+        "wind_speed_kmh": wind_speed,
+        "adjustment_factors": _weather_adjustment_factors(
+            weather_code,
+            wind_speed,
+        ),
+    }
 
 
 def _validate_lane_count(lane_count: Any) -> int:
@@ -308,12 +440,37 @@ def _resolve_video_path(video_value: Any) -> str:
     return str(video_value)
 
 
+def _draw_cached_detections(frame: Any, detections: list[tuple]) -> Any:
+    """Keep the latest sampled boxes visible between model inference frames."""
+    import cv2
+
+    annotated = frame.copy()
+    for (x1, y1, x2, y2), label in detections:
+        top_left = (round(x1), round(y1))
+        bottom_right = (round(x2), round(y2))
+        cv2.rectangle(annotated, top_left, bottom_right, (0, 220, 0), 2)
+        text_y = max(18, top_left[1] - 6)
+        cv2.putText(
+            annotated,
+            label,
+            (top_left[0], text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 220, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    return annotated
+
+
 def process_video(
     video_path: Any,
     lane_count: int = 1,
     detect_lanes_automatically: bool = False,
+    frame_stride: int = 5,
     school_peak: bool = False,
     road_condition: str = "Normal",
+    weather_location: str = "",
     high_risk_zone: bool = False,
     progress: Progress = PROGRESS_TRACKER,
 ) -> tuple[str, str, str, Any, str]:
@@ -321,7 +478,17 @@ def process_video(
     lane_count = _validate_lane_count(lane_count)
     if road_condition not in ROAD_CONDITIONS:
         raise ValueError("Choose one of the listed road conditions.")
+    try:
+        normalized_frame_stride = int(frame_stride)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Frame interval must be a positive whole number.") from error
+    if normalized_frame_stride < 1 or normalized_frame_stride != frame_stride:
+        raise ValueError("Frame interval must be a positive whole number.")
+    frame_stride = normalized_frame_stride
     video_path = _resolve_video_path(video_path)
+    weather = (
+        fetch_open_meteo_weather(weather_location) if weather_location.strip() else None
+    )
 
     import cv2
     import pandas as pd
@@ -359,6 +526,7 @@ def process_video(
     lane_estimate_status = ""
     lane_estimates: list[int] = []
     records: list[dict] = []
+    cached_detections: list[tuple] = []
     succeeded = False
 
     try:
@@ -396,65 +564,77 @@ def process_video(
                 if detected_lane_count is not None:
                     lane_estimates.append(detected_lane_count)
 
-            result = model.track(
-                source=frame,
-                classes=detection_class_ids,
-                persist=True,
-                tracker="botsort.yaml",
-                verbose=False,
-            )[0]
-            boxes = result.boxes
-            class_ids = boxes.cls.tolist() if boxes is not None else []
-            people = sum(int(class_id) in person_class_ids for class_id in class_ids)
-            cars = sum(int(class_id) in car_class_ids for class_id in class_ids)
-            other_vehicles = sum(
-                int(class_id) in heavy_vehicle_class_ids for class_id in class_ids
-            )
-            vehicles = cars + other_vehicles
-            if boxes is not None and len(boxes):
-                track_ids = boxes.id
-                if track_ids is None:
-                    tracking_ids_available = False
-                else:
-                    for class_id, track_id in zip(
-                        class_ids, track_ids.int().tolist()
-                    ):
-                        if int(class_id) in car_class_ids:
-                            track_class_counts = track_class_observations.setdefault(
-                                track_id,
-                                Counter(),
-                            )
-                            track_class_counts["car"] += 1
-                        elif int(class_id) in heavy_vehicle_class_ids:
-                            track_class_counts = track_class_observations.setdefault(
-                                track_id,
-                                Counter(),
-                            )
-                            track_class_counts["other"] += 1
-
-            if boxes is not None and len(boxes):
-                box_coords = boxes.xyxy.tolist()
-                box_area = sum(
-                    max(0.0, x2 - x1) * max(0.0, y2 - y1)
-                    for x1, y1, x2, y2 in box_coords
+            if frame_number % frame_stride == 0:
+                result = model.track(
+                    source=frame,
+                    classes=detection_class_ids,
+                    persist=True,
+                    tracker="botsort.yaml",
+                    verbose=False,
+                )[0]
+                boxes = result.boxes
+                class_ids = boxes.cls.tolist() if boxes is not None else []
+                people = sum(
+                    int(class_id) in person_class_ids for class_id in class_ids
                 )
-                frame_area = float(frame.shape[0] * frame.shape[1])
-                occupancy = min(100.0, box_area / frame_area * 100.0)
-            else:
-                occupancy = 0.0
+                cars = sum(int(class_id) in car_class_ids for class_id in class_ids)
+                other_vehicles = sum(
+                    int(class_id) in heavy_vehicle_class_ids for class_id in class_ids
+                )
+                vehicles = cars + other_vehicles
+                if boxes is not None and len(boxes):
+                    track_ids = boxes.id
+                    if track_ids is None:
+                        tracking_ids_available = False
+                    else:
+                        for class_id, track_id in zip(
+                            class_ids, track_ids.int().tolist()
+                        ):
+                            if int(class_id) in car_class_ids:
+                                track_class_counts = track_class_observations.setdefault(
+                                    track_id,
+                                    Counter(),
+                                )
+                                track_class_counts["car"] += 1
+                            elif int(class_id) in heavy_vehicle_class_ids:
+                                track_class_counts = track_class_observations.setdefault(
+                                    track_id,
+                                    Counter(),
+                                )
+                                track_class_counts["other"] += 1
+                    box_coords = boxes.xyxy.tolist()
+                    class_names = result.names
+                    cached_detections = [
+                        (
+                            coords,
+                            str(class_names[int(class_id)]),
+                        )
+                        for coords, class_id in zip(box_coords, class_ids)
+                    ]
+                    box_area = sum(
+                        max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                        for x1, y1, x2, y2 in box_coords
+                    )
+                    frame_area = float(frame.shape[0] * frame.shape[1])
+                    occupancy = min(100.0, box_area / frame_area * 100.0)
+                else:
+                    cached_detections = []
+                    occupancy = 0.0
 
-            records.append(
-                {
-                    "Time (seconds)": frame_number / fps,
-                    "Vehicles": vehicles,
-                    "Cars": cars,
-                    "Other vehicles": other_vehicles,
-                    "People detected": people,
-                    "Detected box area (%)": round(occupancy, 2),
-                }
-            )
-            annotated_frame = result.plot()
-            sample_count += 1
+                records.append(
+                    {
+                        "Time (seconds)": frame_number / fps,
+                        "Vehicles": vehicles,
+                        "Cars": cars,
+                        "Other vehicles": other_vehicles,
+                        "People detected": people,
+                        "Detected box area (%)": round(occupancy, 2),
+                    }
+                )
+                annotated_frame = result.plot()
+                sample_count += 1
+            else:
+                annotated_frame = _draw_cached_detections(frame, cached_detections)
 
             if writer is None:
                 height, width = frame.shape[:2]
@@ -514,6 +694,9 @@ def process_video(
             peak_vehicle_count,
             lane_count=lane_count,
             road_condition=road_condition,
+            weather_factors=(
+                tuple(weather["adjustment_factors"]) if weather is not None else ()
+            ),
         )
         if tracking_ids_available:
             track_class_totals = Counter(
@@ -536,24 +719,58 @@ def process_video(
             total_vehicle_summary = unique_vehicle_summary
         condition_text = (
             f"**Road condition scenario:** {road_condition} "
-            "(manually selected; not detected from the video). "
-            "Automatic weather classification is disabled because it was "
-            "unreliable on traffic-camera footage."
+            "(manually selected)."
         )
-        if road_condition in RESTRICTIVE_ROAD_CONDITIONS:
+        if weather is None:
             condition_text += (
-                "\n\nThe selected condition lowers the demo recommendation "
-                "by one band (20 km/h, with a 60 km/h floor)."
+                "\n\n**Open-Meteo weather:** not requested. Enter a location "
+                "to retrieve current conditions and include weather in the "
+                "demo speed adjustment."
+            )
+        else:
+            condition_text += (
+                f"\n\n**Current Open-Meteo weather for "
+                f"{weather['location']}:** {weather['condition']}"
+            )
+            if weather["temperature_c"] is not None:
+                condition_text += f", {weather['temperature_c']}°C"
+            if weather["precipitation_mm"] is not None:
+                condition_text += f", precipitation {weather['precipitation_mm']} mm"
+            condition_text += (
+                f", wind {weather['wind_speed_kmh']} km/h"
+            )
+            condition_text += (
+                ". This is current local weather, not historical weather "
+                "at the video's recording time."
+            )
+            if weather["adjustment_factors"]:
+                condition_text += (
+                    "\n\nWeather speed factors applied: "
+                    + ", ".join(sorted(weather["adjustment_factors"]))
+                    + "."
+                )
+            else:
+                condition_text += "\n\nNo adverse-weather speed factor detected."
+        has_manual_adjustment = road_condition in ROAD_CONDITION_FACTORS
+        if has_manual_adjustment or (
+            weather is not None and weather["adjustment_factors"]
+        ):
+            condition_text += (
+                "\n\nEach distinct factor lowers the density-based demo "
+                "recommendation by one 20 km/h band, down to 60 km/h. "
+                "Duplicate wet-road/rain or reduced-visibility/fog factors "
+                "are counted once."
             )
         speed_text = (
             f"## {speed} km/h\n"
             "Detector: pretrained YOLOv8n (recommended)\n\n"
             f"Demo only · {total_vehicle_summary}\n\n"
-            f"Peak frame: {peak_vehicle_count} vehicles across "
+            f"Peak sampled frame: {peak_vehicle_count} vehicles across "
             f"{lane_count} lane(s) "
             f"({vehicles_per_lane:.1f} vehicles per lane)\n\n"
             f"Class labels at peak: {peak_car_count} cars, "
-            f"{peak_other_vehicle_count} buses/trucks/vans"
+            f"{peak_other_vehicle_count} buses/trucks/vans\n\n"
+            f"Weather location: {weather['location'] if weather else 'not entered'}"
         )
         speed_text += f"\n\nLane count: {lane_count} ({lane_count_source})"
         if lane_estimate_status:
@@ -590,13 +807,15 @@ def process_video(
             "### Clip analysis\n"
             "- Detection model: pretrained YOLOv8n from Hugging Face\n"
             f"- Frames: {source_frames} · analyzed: {sample_count} · "
-            "tracked on every frame\n"
+            f"detected every {frame_stride} frame(s)\n"
             f"- {total_vehicle_summary}\n"
             f"- Peak vehicles in one frame: "
             f"{peak_vehicle_count} at "
             f"{float(traffic_peak['Time (seconds)']):.1f}s into the clip\n"
             f"- Class labels at peak: {peak_car_count} cars, "
             f"{peak_other_vehicle_count} buses/trucks/vans\n"
+            f"- Weather lookup: "
+            f"{weather['condition'] + ' at ' + weather['location'] if weather else 'not requested'}\n"
             f"- Lowest vehicle detections: {int(traffic_lull['Vehicles'])} at "
             f"{float(traffic_lull['Time (seconds)']):.1f}s into the clip\n"
             f"{people_summary}"
@@ -607,14 +826,16 @@ def process_video(
             f"{lane_source_summary}\n"
             f"- {unique_vehicle_summary}\n"
             "  Tracking can still miss a vehicle or assign a new ID after "
-            "occlusion, so totals are estimates rather than ground truth.\n\n"
+            "occlusion, so totals are estimates rather than ground truth. "
+            "Boxes are held between analyzed frames and may lag vehicle motion.\n\n"
             "**Other scenario inputs (simulated, not live feeds):** "
             f"{_context_summary(school_peak, road_condition, high_risk_zone)}\n\n"
             f"**Scope:** {crowd_note} {timing_note}\n\n"
             "**Demo rule:** thresholds apply to all detected vehicles per lane "
-            "(<5: 100; 5–15: 80; >15: 60 km/h). A manually selected wet road, "
-            "roadworks, or reduced-visibility scenario lowers one band "
-            "(100→80, 80→60, 60 stays 60). These values are not validated "
+            "(<5: 100; 5–15: 80; >15: 60 km/h). Rain, snow, fog, or wind "
+            "at least 50 km/h lowers one band per distinct factor; manually "
+            "selected roadworks and road conditions can add factors. "
+            "These values are not validated "
             "speed limits. "
             "No live camera, weather service, school calendar, road-condition "
             "feed, accident data, or traffic sign is connected."
@@ -692,8 +913,8 @@ def launch_app() -> None:
             "### A Hugging Face-powered research prototype for Doha traffic scenarios\n\n"
             "Upload an authorized clip to explore vehicle and pedestrian-count "
             "trends. Road, school, and zone inputs are manually selected "
-            "scenarios. Automatic weather classification is disabled because "
-            "it was unreliable on traffic-camera footage."
+            "scenarios. Current weather can be fetched from Open-Meteo for an "
+            "entered location; it may not match the clip's recording time."
         )
         gr.Markdown(
             "<div class='safety-note'><b>Research demo only.</b> This app "
@@ -752,6 +973,18 @@ def launch_app() -> None:
                                 "highly inconsistent results use the manual count."
                             ),
                         )
+                        frame_stride = gr.Slider(
+                            minimum=1,
+                            maximum=15,
+                            value=5,
+                            step=1,
+                            label="Run detection every Nth frame",
+                            info=(
+                                "Default 5 analyzes about 6 frames/second in a "
+                                "30 FPS video. Boxes stay visible between "
+                                "detections; increase N for faster analysis."
+                            ),
+                        )
                         with gr.Accordion("Scenario controls (simulated)", open=True):
                             school_peak = gr.Checkbox(
                                 label="School arrival / dismissal scenario",
@@ -765,6 +998,18 @@ def launch_app() -> None:
                                     "Wet road, roadworks, and reduced visibility "
                                     "lower the demo speed by one band. This is "
                                     "a manual scenario, not video detection."
+                                ),
+                            )
+                            weather_location = gr.Textbox(
+                                label="Location for current weather",
+                                placeholder="e.g., Doha, Qatar",
+                                info=(
+                                    "Open-Meteo looks up current conditions, "
+                                    "not weather at the video's recording time. "
+                                    "Your location is sent to Open-Meteo. "
+                                    "Rain, snow, fog, or wind ≥50 km/h lowers "
+                                    "the demo speed by one band. Leave blank "
+                                    "to skip weather adjustment."
                                 ),
                             )
                             high_risk_zone = gr.Checkbox(
@@ -784,11 +1029,12 @@ def launch_app() -> None:
                         )
                         condition_output = gr.Markdown(
                             "**Road condition scenario:** waiting for analysis\n\n"
-                            "Selected manually. Automatic weather classification "
-                            "is disabled because it was unreliable."
+                            "Enter a location to get current weather from "
+                            "Open-Meteo and include adverse conditions in the "
+                            "demo speed adjustment."
                         )
                         output_video = gr.Video(
-                            label="Video with tracked detections on every frame"
+                            label="Video with detections held between samples"
                         )
                 trend_plot = gr.Plot(
                     label="Traffic and people detected over clip time",
@@ -801,8 +1047,10 @@ def launch_app() -> None:
                         input_video,
                         lane_count,
                         detect_lanes_automatically,
+                        frame_stride,
                         school_peak,
                         road_condition,
+                        weather_location,
                         high_risk_zone,
                     ],
                     outputs=[
@@ -860,10 +1108,9 @@ def launch_app() -> None:
             with gr.Accordion("How to interpret this demo", open=False):
                 gr.Markdown(
                     "### What the prototype measures\n"
-                    "- YOLOv8 detects cars, buses, trucks, vans, and people "
-                    "on every frame; BoT-SORT estimates unique cars and "
-                    "other vehicles "
-                    "across those frames.\n"
+                    "- YOLOv8 and BoT-SORT run on every Nth frame; boxes are "
+                    "held between detections. Vehicle totals are estimated "
+                    "from the analyzed frames.\n"
                     "- The trend plot shows detections during this clip only. "
                     "It does not track unique people or infer crossing intent "
                     "or other pedestrian behavior.\n"

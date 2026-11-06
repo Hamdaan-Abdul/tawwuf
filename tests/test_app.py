@@ -1,8 +1,11 @@
+import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlparse
 
 import app
 import train
@@ -132,6 +135,92 @@ class AppTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "listed road conditions"):
             app.recommended_speed_kmh(4, road_condition="Storm")
 
+    def test_weather_factors_reduce_speed_and_duplicate_conditions_count_once(self):
+        self.assertEqual(
+            app.recommended_speed_kmh(
+                4,
+                lane_count=4,
+                weather_factors=("precipitation",),
+            ),
+            80,
+        )
+        self.assertEqual(
+            app.recommended_speed_kmh(
+                4,
+                lane_count=4,
+                road_condition="Wet road",
+                weather_factors=("precipitation",),
+            ),
+            80,
+        )
+        self.assertEqual(
+            app.recommended_speed_kmh(
+                4,
+                lane_count=4,
+                road_condition="Roadworks",
+                weather_factors=("precipitation",),
+            ),
+            60,
+        )
+
+    @patch("app.urlopen")
+    def test_open_meteo_geocodes_location_and_returns_current_weather(self, open_url):
+        open_url.side_effect = [
+            BytesIO(
+                json.dumps(
+                    {
+                        "results": [
+                            {
+                                "name": "Doha",
+                                "admin1": "Doha",
+                                "country": "Qatar",
+                                "latitude": 25.29,
+                                "longitude": 51.53,
+                                "timezone": "Asia/Qatar",
+                            }
+                        ]
+                    }
+                ).encode()
+            ),
+            BytesIO(
+                json.dumps(
+                    {
+                        "timezone": "Asia/Qatar",
+                        "current": {
+                            "temperature_2m": 35.2,
+                            "precipitation": 1.4,
+                            "rain": 1.4,
+                            "snowfall": 0.0,
+                            "weather_code": 61,
+                            "wind_speed_10m": 12.0,
+                        },
+                    }
+                ).encode()
+            ),
+        ]
+
+        weather = app.fetch_open_meteo_weather("Doha, Qatar")
+
+        self.assertEqual(weather["location"], "Doha, Qatar")
+        self.assertEqual(weather["condition"], "Rain")
+        self.assertEqual(weather["temperature_c"], 35.2)
+        self.assertEqual(weather["adjustment_factors"], {"precipitation"})
+        self.assertEqual(open_url.call_count, 2)
+        self.assertIn(
+            "geocoding-api.open-meteo.com",
+            urlparse(open_url.call_args_list[0].args[0]).netloc,
+        )
+        forecast_query = parse_qs(urlparse(open_url.call_args_list[1].args[0]).query)
+        self.assertEqual(forecast_query["wind_speed_unit"], ["kmh"])
+        self.assertIn("weather_code", forecast_query["current"][0])
+
+    @patch("app.urlopen")
+    def test_open_meteo_reports_unknown_location(self, open_url):
+        open_url.return_value = BytesIO(json.dumps({"results": None}).encode())
+
+        with self.assertRaisesRegex(ValueError, "could not find a location"):
+            app.fetch_open_meteo_weather("Atlantis")
+
     def test_context_is_explicitly_a_scenario(self):
         context = app._context_summary(True, "Roadworks", False)
         self.assertIn("School-peak scenario: On", context)
@@ -157,14 +246,37 @@ class AppTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "listed road conditions"):
             app.process_video("input.mp4", road_condition="Storm")
 
+    def test_video_rejects_non_integer_frame_interval(self):
+        for frame_stride in (0, -1, 1.5):
+            with self.subTest(frame_stride=frame_stride), self.assertRaisesRegex(
+                ValueError, "positive whole number"
+            ):
+                app.process_video("input.mp4", frame_stride=frame_stride)
+
     @patch("cv2.VideoWriter_fourcc", return_value=123)
     @patch("cv2.VideoWriter")
     @patch("cv2.VideoCapture")
     @patch("app._make_trend_plot", return_value="plot")
+    @patch(
+        "app.fetch_open_meteo_weather",
+        return_value={
+            "location": "Doha, Qatar",
+            "timezone": "Asia/Qatar",
+            "condition": "Rain",
+            "weather_code": 61,
+            "temperature_c": 30.0,
+            "precipitation_mm": 1.0,
+            "rain_mm": 1.0,
+            "snowfall_cm": 0.0,
+            "wind_speed_kmh": 20.0,
+            "adjustment_factors": {"precipitation"},
+        },
+    )
     @patch("app.load_model")
     def test_video_counts_all_vehicle_classes_and_uses_peak_count_for_speed(
         self,
         load_model,
+        fetch_weather,
         _make_trend_plot,
         video_capture,
         video_writer,
@@ -227,6 +339,7 @@ class AppTests(unittest.TestCase):
                 return [
                     SimpleNamespace(
                         boxes=FakeBoxes(class_ids, ids),
+                        names=self.names,
                         plot=lambda: frames[0],
                     )
                 ]
@@ -236,24 +349,32 @@ class AppTests(unittest.TestCase):
         output_path, speed_text, condition_text, _plot, summary = app.process_video(
             "input.mp4",
             lane_count=4,
+            frame_stride=2,
             road_condition="Roadworks",
+            weather_location="Doha, Qatar",
             progress=Mock(),
         )
         try:
+            fetch_weather.assert_called_once_with("Doha, Qatar")
             load_model.assert_called_once_with()
-            self.assertEqual(load_model.return_value.track_call_count, len(frames))
+            self.assertEqual(load_model.return_value.track_call_count, 2)
             self.assertTrue(load_model.return_value.uses_botsort)
             self.assertEqual(writer.write.call_count, len(frames))
-            self.assertIn("80 km/h", speed_text)
+            self.assertTrue(writer.write.call_args_list[1].args[0].any())
+            self.assertIn("60 km/h", speed_text)
             self.assertIn("Detector: pretrained YOLOv8n (recommended)", speed_text)
             self.assertIn("Total unique vehicles in clip: 16", speed_text)
-            self.assertIn("Peak frame: 16 vehicles", speed_text)
+            self.assertIn("Peak sampled frame: 16 vehicles", speed_text)
             self.assertIn("12 cars, 4 buses/trucks/vans", speed_text)
             self.assertIn("Total unique vehicles in clip: 16", summary)
-            self.assertIn("Tracked class totals: 11 cars, 5 buses/trucks/vans", summary)
-            self.assertIn("tracked on every frame", summary)
+            self.assertIn("Tracked class totals: 12 cars, 4 buses/trucks/vans", summary)
+            self.assertIn("analyzed: 2", summary)
+            self.assertIn("detected every 2 frame(s)", summary)
+            self.assertIn("Boxes are held between analyzed frames", summary)
             self.assertIn("Road condition scenario:** Roadworks", condition_text)
-            self.assertIn("lowers the demo recommendation by one band", condition_text)
+            self.assertIn("Current Open-Meteo weather for Doha, Qatar:** Rain", condition_text)
+            self.assertIn("Weather speed factors applied: precipitation", condition_text)
+            self.assertIn("Each distinct factor lowers", condition_text)
             self.assertIn("Detection model: pretrained YOLOv8n", summary)
             self.assertIn("Road scenario: Roadworks", summary)
             self.assertIn("estimates rather than ground truth", summary)
@@ -318,12 +439,17 @@ class AppTests(unittest.TestCase):
             3: "van",
         }
         load_model.return_value.track.return_value = [
-            SimpleNamespace(boxes=FakeBoxes(), plot=lambda: frame)
+            SimpleNamespace(
+                boxes=FakeBoxes(),
+                names=load_model.return_value.names,
+                plot=lambda: frame,
+            )
         ]
 
         output_path, speed_text, _weather, _plot, summary = app.process_video(
             "input.mp4",
             lane_count=1,
+            frame_stride=1,
             detect_lanes_automatically=True,
             progress=Mock(),
         )

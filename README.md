@@ -29,15 +29,18 @@ web server and is expected to keep running. Press `Ctrl+C` when you want to stop
 the server.
 
 Open the local URL printed by Gradio. Upload a video, enter the number of lanes
-visible in the camera view, and select the road-condition scenario. The app
+visible in the camera view, enter a location for current weather, and select
+the road-condition scenario. The app
 uses pretrained YOLOv8n from the Hugging Face Hub; the separately fine-tuned
-model is not used because it misclassifies cars as buses, trucks, or vans. The
-detector and tracker run on every frame, and the output video keeps detections
-visible throughout playback. The app reports an estimated unique-vehicle total
-and the peak number present in any one frame. Full-frame tracking is slower
-than sparse sampling, but avoids tracker gaps and makes the peak consistent.
-The first run downloads `yolov8n.pt` from
-[Ultralytics/YOLOv8 on the Hugging Face Hub](https://huggingface.co/Ultralytics/YOLOv8)
+model is not used because it misclassifies cars as buses, trucks, or vans. By
+default, detection runs every 5th frame (about 6 detections/second for 30 FPS
+video). A slider lets you trade speed for denser analysis. Boxes are kept
+visible between analyzed frames using the most recent detections, so they may
+lag moving vehicles by up to the selected interval. The app reports an
+estimated unique-vehicle total and the peak among analyzed frames. The first
+run downloads `yolov8n.pt` from
+[Ultralytics/YOLOv8 on the Hugging Face Hub](https://huggingface.co/Ultralytics/YOLOv8).
+
 When automatic lane estimation is enabled, it also downloads
 [NVIDIA SegFormer B0 fine-tuned on Cityscapes](https://huggingface.co/nvidia/segformer-b0-finetuned-cityscapes-1024-1024)
 to separate road from sidewalk before estimating lane lines. These models are
@@ -54,14 +57,26 @@ line estimates can be wrong with faded markings, occlusion, or unusual road
 layouts. Verify the estimate. The first analysis can take longer while models
 download and load. After that, models are cached locally. The app shows progress
 for model loading and frame analysis. Longer or higher-resolution videos take
-longer because every frame is analyzed.
+longer; raise the detection interval to reduce inference time.
 
-Automatic weather classification is disabled because it incorrectly labeled
-clear traffic footage as rainy. The **Road condition** control is a manual
-scenario, not an AI prediction. Selecting **Wet road**, **Roadworks**, or
-**Reduced visibility** lowers the density-based demo recommendation by one
-band (20 km/h, with a 60 km/h floor). **Normal** leaves the density-based
-recommendation unchanged.
+Enter a place such as **Doha, Qatar** in **Location for current weather** to
+look it up with Open-Meteo's free geocoding and forecast APIs. No API key is
+required. Open-Meteo's current weather code maps precipitation (rain, snow,
+drizzle, or thunderstorms) to a 20 km/h demo reduction, fog to a 20 km/h
+reduction, and wind at or above 50 km/h to a 20 km/h reduction. Distinct
+weather factors can each lower one band, down to 60 km/h. The manually selected
+**Wet road** and **Reduced visibility** factors are not double-counted when
+Open-Meteo reports precipitation or fog; **Roadworks** adds a separate band.
+The entered location is sent to Open-Meteo for geocoding and weather lookup.
+Leaving it blank skips weather lookup and leaves only the manually selected
+road condition in effect.
+
+Open-Meteo returns **current** weather, not historical weather for an uploaded
+clip. It only represents the video if the clip was recorded at that place and
+around the current time. Sample clips may be old or from an unknown location,
+so their speed adjustment should be treated as a demonstration, not a
+weather-aware measurement. The speed thresholds and weather adjustments are
+illustrative, not validated traffic or safety recommendations.
 
 ## Optional Hugging Face training job
 
@@ -131,8 +146,8 @@ secret and review the source dataset's access terms first.
 - Person detections are approximate counts, not unique-person tracking or
   pedestrian-behavior understanding. Detected box area is not calibrated road
   density.
-- YOLO's BoT-SORT tracker estimates unique cars and other vehicles by tracking
-  every frame. The peak and speed demo use all detected car, bus, truck, and
+- YOLO's BoT-SORT tracker estimates unique cars and other vehicles on sampled
+  frames. The peak and speed demo use all detected car, bus, truck, and
   van classes, and show their class breakdown. A track's displayed class is
   its most frequent label across frames to reduce label flicker. The unique
   total is still an estimate, not ground truth: occlusion or a lost/reassigned
@@ -145,11 +160,12 @@ secret and review the source dataset's access terms first.
 - The speed calculation divides vehicle detections in the busiest frame by
   the manually entered lane count or automatic estimate, then applies
   the demo thresholds per lane: fewer than 5 vehicles/lane = 100 km/h, 5–15
-  = 80 km/h, more than 15 = 60 km/h. Manually selecting wet road, roadworks,
-  or reduced visibility lowers the demo result one band (100→80, 80→60,
-  60 stays 60). Automatic weather classification is disabled because it was
-  unreliable on traffic-camera footage. School, road-condition, and
-  high-risk-zone controls are simulated scenarios, not live feeds.
+  = 80 km/h, more than 15 = 60 km/h. Open-Meteo current precipitation, fog,
+  or wind ≥50 km/h lowers the result one band per distinct factor. Manual wet
+  road/reduced visibility factors are deduplicated against precipitation/fog;
+  roadworks is a separate manual factor. This is only appropriate for a video
+  matching the entered location and current time. School and high-risk-zone
+  controls are simulated scenarios, not live feeds.
 - Dataset search may return data from other countries or with restrictive
   terms. Review provenance, license, privacy, and local relevance before
   research or use.
